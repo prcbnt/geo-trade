@@ -39,6 +39,26 @@ BATIS_ZIP = "https://www.wto.org/english/res_e/statis_e/daily_update_e/OECD-WTO_
 DEP_SHARE = 0.50
 DEP_MIN_K = 1000
 DEP_TOP = 12
+CRIT_WORLD = 0.30   # supplier holds >= 30 % of world exports of the product: hard to replace
+
+# Strategic products (HS92 codes): HS4 headings or full HS6 codes
+STRATEGIC = {
+    "Semi-conducteurs": {"hs4": [8541, 8542]},
+    "Terres rares & métaux critiques": {"hs4": [2805, 2846, 8104, 8105, 8110, 8112], "hs6": [282520, 283691]},
+    "Batteries": {"hs4": [8507]},
+    "Pharmacie (principes actifs, médicaments)": {"hs4": [2936, 2937, 2939, 2941, 3002, 3003, 3004]},
+    "Énergie": {"hs4": [2701, 2709, 2710, 2711, 2844]},
+    "Aéronautique": {"hs4": [8411, 8802, 8803]},
+    "Armement": {"hs2": [93]},
+}
+_S4 = np.array(sorted({h for v in STRATEGIC.values() for h in v.get("hs4", [])}))
+_S6 = np.array(sorted({h for v in STRATEGIC.values() for h in v.get("hs6", [])}))
+_S2 = np.array(sorted({h for v in STRATEGIC.values() for h in v.get("hs2", [])}))
+
+
+def strategic(k):
+    k = np.asarray(k)
+    return (np.isin(k // 100, _S4) | np.isin(k, _S6) | np.isin(k // 10000, _S2)).astype(np.int64)
 
 EU = "EU27"
 EU_ISO3 = ["AUT", "BEL", "BGR", "HRV", "CYP", "CZE", "DNK", "EST", "FIN", "FRA", "DEU", "GRC", "HUN", "IRL",
@@ -105,8 +125,8 @@ def log(*a):
     print(*a, flush=True)
 
 
-def fetch(url, timeout=120):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 trade-map-builder"})
+def fetch(url, timeout=120, ua="Mozilla/5.0 trade-map-builder"):
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -230,14 +250,24 @@ def goods(zpath, store, countries):
                 store.put(key_of.get(j, f"C{j}"), "m", ys, key_of.get(i, f"C{i}"), int(v))
 
     def emit_d(df, ic, jc, ys, keep=None):
-        tot = df.groupby([jc, "k"])["v"].transform("sum")
-        sel = df.assign(sh=df["v"] / tot)
-        sel = sel[(sel["sh"] >= DEP_SHARE) & (sel["v"] >= DEP_MIN_K)]
+        # one row per exporter, importer, product
+        a = df.groupby([ic, jc, "k"], as_index=False)["v"].sum()
+        a["sh"] = a["v"] / a.groupby([jc, "k"])["v"].transform("sum")                         # supplier share in importer's purchases
+        a["ws"] = a.groupby([ic, "k"])["v"].transform("sum") / a.groupby("k")["v"].transform("sum")  # supplier share of world exports
+        sel = a[(a["sh"] >= DEP_SHARE) & (a["v"] >= DEP_MIN_K)]
         if keep is not None:
             sel = sel[keep(sel)]
-        sel = sel.sort_values("v", ascending=False).groupby([jc, ic]).head(DEP_TOP)
-        for j, i, k, v, sh in sel[[jc, ic, "k", "v", "sh"]].itertuples(index=False):
-            store.add_list(key_of.get(j, f"C{j}"), "d", ys, key_of.get(i, f"C{i}"), [int(k), int(round(v)), int(round(sh * 100))])
+        # critical dependence: dominant supplier for the importer AND hard to replace on the world market
+        crit = sel[sel["ws"] >= CRIT_WORLD].assign(st=lambda d: strategic(d["k"].to_numpy()))
+        crit = crit.assign(sv=crit["v"] * crit["st"])
+        agg = crit.groupby([jc, ic]).agg(v=("v", "sum"), n=("v", "size"), sv=("sv", "sum"), sn=("st", "sum"))
+        for (j, i), r in agg.iterrows():
+            store.put(key_of.get(j, f"C{j}"), "cd", ys, key_of.get(i, f"C{i}"),
+                      [int(round(r["v"])), int(r["n"]), int(round(r["sv"])), int(r["sn"])])
+        top = sel.sort_values("v", ascending=False).groupby([jc, ic]).head(DEP_TOP)
+        for j, i, k, v, sh, ws in top[[jc, ic, "k", "v", "sh", "ws"]].itertuples(index=False):
+            store.add_list(key_of.get(j, f"C{j}"), "d", ys, key_of.get(i, f"C{i}"),
+                           [int(k), int(round(v)), int(round(sh * 100)), int(round(ws * 100))])
 
     def pivot(df, ic, jc):
         p = df.groupby([ic, jc, "g"])["v"].sum().unstack("g", fill_value=0.0)
@@ -363,6 +393,42 @@ def services(zpath, store, iso2_key):
     return sorted(int(y) for y in t["Year"].unique())
 
 
+# ---------------------------------------------------------------- GDP
+WB_GDP = "https://api.worldbank.org/v2/country/all/indicator/NY.GDP.MKTP.CD?format=json&per_page=20000&date={y0}:{y1}"
+IMF_GDP = "https://www.imf.org/external/datamapper/api/v1/NGDPD"
+
+
+def gdp(keys, y0, y1):
+    """GDP in thousands of current USD: World Bank first, IMF WEO for gaps (e.g. Taiwan)."""
+    out = defaultdict(dict)
+    alias = {EU: "EUU"}
+    try:
+        rows = json.load(fetch(WB_GDP.format(y0=y0, y1=y1)))[1] or []
+        wb = {(r["countryiso3code"], r["date"]): r["value"] for r in rows if r.get("value")}
+        for k in keys:
+            for y in range(y0, y1 + 1):
+                v = wb.get((alias.get(k, k), str(y)))
+                if v:
+                    out[k][str(y)] = int(v / 1000)
+        log(f"GDP World Bank: {len(out)} economies")
+    except Exception as e:
+        log("World Bank GDP failed:", e)
+    try:
+        imf = json.load(fetch(IMF_GDP, ua="curl/8.5.0"))["values"]["NGDPD"]
+        alias_imf = {EU: "EU"}
+        n = 0
+        for k in keys:
+            src = imf.get(alias_imf.get(k, k), {})
+            for y in range(y0, y1 + 1):
+                if str(y) not in out[k] and src.get(str(y)):
+                    out[k][str(y)] = int(src[str(y)] * 1e6)  # billions USD -> k$
+                    n += 1
+        log(f"GDP IMF gap-fill: {n} values")
+    except Exception as e:
+        log("IMF GDP failed:", e)
+    return {k: v for k, v in out.items() if v}
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -421,7 +487,9 @@ def main():
         "syears": syears,
         "groups": [g for g, _ in GROUPS],
         "sgroups": [l for _, l in SITEMS],
-        "dep": {"share": DEP_SHARE, "min_k": DEP_MIN_K},
+        "dep": {"share": DEP_SHARE, "min_k": DEP_MIN_K, "world": CRIT_WORLD},
+        "strategic": {k: v for k, v in STRATEGIC.items()},
+        "gdp": gdp([c["k"] for c in clist if not re.fullmatch(r"C\d+", c["k"])], gyears[0], gyears[-1]),
         "eu": EU,
         "hubs": HUBS,
         "countries": clist,

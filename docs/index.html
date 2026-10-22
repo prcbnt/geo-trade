@@ -382,8 +382,52 @@ const prodName=k=>(S.prod&&S.prod[String(k)])||('HS '+String(k).padStart(6,'0'))
 function depTable(list,title,na){
   if(na)return `<h3>${title}</h3><div class="empty">${na}</div>`;
   if(!list||!list.length)return `<h3>${title}</h3><div class="empty">Aucune dépendance au-dessus du seuil.</div>`;
-  return `<h3>${title}</h3><table><thead><tr><th>Produit (HS6)</th><th class="n">Part</th><th class="n">Valeur</th></tr></thead><tbody>${
-    list.map(([k,v,sh])=>`<tr><td>${esc(prodName(k))}<div class="sub">${String(k).padStart(6,'0')}</div></td><td class="n"><b>${sh} %</b></td><td class="n">${fmt(v)}</td></tr>`).join('')}</tbody></table>`;
+  const W=Math.round((S.meta.dep.world||.3)*100);
+  return `<h3>${title}</h3><table><thead><tr><th>Produit (HS6)</th><th class="n">Part</th><th class="n">Part mondiale</th><th class="n">Valeur</th></tr></thead><tbody>${
+    list.map(([k,v,sh,ws])=>`<tr><td>${esc(prodName(k))}<div class="sub">${String(k).padStart(6,'0')}${ws>=W?' · <b style="color:#000">CRITIQUE</b>':''}</div></td><td class="n"><b>${sh} %</b></td><td class="n">${ws==null?'—':ws+' %'}</td><td class="n">${fmt(v)}</td></tr>`).join('')}</tbody></table>`;
+}
+const pct=v=>v==null||!isFinite(v)?'n.d.':(v<0.1&&v>0?'< 0,1':nf1.format(v))+' %';
+const times=v=>'×'+(v>=10?nf0:nf1).format(v);
+function powerBlock(p,y){
+  const A=S.curA,B=S.curB;
+  if(p.rest)return '';
+  const G=S.meta.gdp||{};
+  const gA=(G[S.A]||{})[y],gB=(G[S.B]||{})[y];
+  const T=p.e+p.i;
+  const wA=world(A,y),wB=world(B,y);
+  const cA=get(A,'cd',y,S.B)||[0,0,0,0];   // A depends critically on B
+  const cB=get(B,'cd',y,S.A)||[0,0,0,0];
+  const eA=gA?T/gA*100:null,eB=gB?T/gB*100:null;
+  const sA=(wA.e+wA.i)?T/(wA.e+wA.i)*100:null,sB=(wB.e+wB.i)?T/(wB.e+wB.i)*100:null;
+  const pA=gA?cA[0]/gA*100:null,pB=gB?cB[0]/gB*100:null;
+  const nA=esc(name(S.A)),nB=esc(name(S.B));
+  // leverage: geometric mean of exposure ratio and critical-dependence ratio (both A vs B)
+  let verdict='';
+  if(eA!=null&&eB!=null){
+    const r1=eA/eB;
+    let r=r1,basis='exposition seule (aucune dépendance critique dans un sens ni dans l’autre)';
+    if(cA[0]>0||cB[0]>0){
+      const f=0.01; // floor: 0.01 % of GDP, so a one-sided dependence gives a finite ratio
+      r=Math.sqrt(r1*(Math.max(pA,f)/Math.max(pB,f)));
+      basis=cA[0]>0&&cB[0]>0?'exposition et dépendances critiques réciproques':('exposition et dépendance critique unilatérale de '+(cA[0]>0?nA:nB));
+    }
+    const strong=r>=1?nB:nA,weak=r>=1?nA:nB,k=r>=1?r:1/r;
+    verdict=k<1.5?`<div class="v">Équilibre relatif</div><div class="s">Base : ${basis}.</div>`
+      :`<div class="v">${strong} ${times(k)}</div><div class="s">${weak} est environ ${times(k).slice(1)} fois plus vulnérable. Base : ${basis}.</div>`;
+  }else verdict='<div class="v">n.d.</div><div class="s">PIB indisponible pour cette année.</div>';
+  const row=(l,a,b)=>`<tr><td>${l}</td><td class="n">${a}</td><td class="n">${b}</td></tr>`;
+  return `<section><h2>Rapport de force · ${y}</h2>
+    <div class="grid"><div class="col12 kpi" style="grid-column:1/-1"><div class="lbl">Levier estimé</div>${verdict}</div></div>
+    <table style="margin-top:16px"><thead><tr><th></th><th class="n">${nA}</th><th class="n">${nB}</th></tr></thead><tbody>
+    ${row('PIB',gA?fmt(gA):'n.d.',gB?fmt(gB):'n.d.')}
+    ${row(`Commerce bilatéral (${MODE[S.mode]}) en % du PIB`,pct(eA),pct(eB))}
+    ${row('Poids du partenaire dans le commerce total',pct(sA),pct(sB))}
+    ${row('Dépendance critique envers l’autre · biens',cA[0]?`<b>${fmt(cA[0])}</b> · ${cA[1]} produit${cA[1]>1?'s':''}`:'—',cB[0]?`<b>${fmt(cB[0])}</b> · ${cB[1]} produit${cB[1]>1?'s':''}`:'—')}
+    ${row('dont produits stratégiques',cA[2]?`${fmt(cA[2])} · ${cA[3]}`:'—',cB[2]?`${fmt(cB[2])} · ${cB[3]}`:'—')}
+    ${row('Dépendance critique en % du PIB',pct(pA),pct(pB))}
+    </tbody></table>
+    <p class="hint" style="margin-top:12px">Dépendance critique : produits HS6 dont l’autre pays fournit au moins ${Math.round(S.meta.dep.share*100)} % des importations ET au moins ${Math.round((S.meta.dep.world||.3)*100)} % des exportations mondiales, donc difficiles à remplacer. Stratégiques : ${Object.keys(S.meta.strategic||{}).join(', ').toLowerCase()}. Levier = moyenne géométrique du ratio d’exposition (% du PIB) et du ratio de dépendance critique (% du PIB). Indicateur fondé sur le commerce uniquement : finance, technologie, énergie et défense n’y figurent pas.</p>
+  </section>`;
 }
 function hubNotes(){
   const H=S.meta.hubs||{};
@@ -469,7 +513,7 @@ function render(){
       ${kpi(`Exports ${nB} → ${nA}`,fmt(p.i))}
       ${kpi(`Solde de ${nA}`,fmt(p.b,true),ratio?`Taux de couverture ${nf0.format(ratio*100)} %`:'')}
       ${kpi('Poids pour '+nA,nf1.format(shareA)+' %','du commerce total de '+nA)}
-    </div>${hubNotes()}${qnote}</section>
+    </div>${hubNotes()}${qnote}</section>${powerBlock(p,y)}
     <section><h2>Évolution ${span}</h2><div id="ch"></div></section>
     <section><h2>Par catégorie</h2>${cats}</section>${deps}`;
   chart($('#ch'),ser,`${name(S.A)} → ${p.rest?'reste UE':name(S.B)}`,`${p.rest?'reste UE':name(S.B)} → ${name(S.A)}`);
